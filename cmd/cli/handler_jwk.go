@@ -23,11 +23,17 @@ package cli
 import (
 	"crypto/tls"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"os"
 
+	"github.com/mendsley/gojwk"
 	"github.com/ory/hydra/config"
+	"github.com/ory/hydra/pkg"
 	hydra "github.com/ory/hydra/sdk/go/hydra/swagger"
+	"github.com/pborman/uuid"
 	"github.com/spf13/cobra"
+	"gopkg.in/square/go-jose.v2"
 )
 
 type JWKHandler struct {
@@ -74,6 +80,82 @@ func (h *JWKHandler) CreateKeys(cmd *cobra.Command, args []string) {
 	keys, response, err := m.CreateJsonWebKeySet(args[0], hydra.JsonWebKeySetGeneratorRequest{Alg: alg, Kid: kid, Use: use})
 	checkResponse(response, err, http.StatusCreated)
 	fmt.Printf("%s\n", formatResponse(keys))
+}
+
+func toSDKFriendlyJSONWebKey(key interface{}, kid string, use string, public bool) hydra.JsonWebKey {
+	if jwk, ok := key.(*jose.JSONWebKey); ok {
+		key = jwk.Key
+		if jwk.KeyID != "" {
+			kid = jwk.KeyID
+		}
+		if jwk.Use != "" {
+			use = jwk.Use
+		}
+	}
+
+	var err error
+	var jwk *gojwk.Key
+	if public {
+		jwk, err = gojwk.PublicKey(key)
+		pkg.Must(err, "Unable to convert public key to JSON Web Key because %s", err)
+	} else {
+		jwk, err = gojwk.PrivateKey(key)
+		pkg.Must(err, "Unable to convert private key to JSON Web Key because %s", err)
+	}
+
+	return hydra.JsonWebKey{
+		Use: use,
+		Kid: kid,
+		Kty: jwk.Kty,
+		Alg: jwk.Alg,
+		Crv: jwk.Crv,
+		D:   jwk.D,
+		E:   jwk.E,
+		K:   jwk.K,
+		N:   jwk.N,
+		X:   jwk.X,
+		Y:   jwk.Y,
+	}
+}
+
+func (h *JWKHandler) ImportKeys(cmd *cobra.Command, args []string) {
+	m := h.newJwkManager(cmd)
+	if len(args) < 2 {
+		fmt.Println(cmd.UsageString())
+		return
+	}
+
+	id := args[0]
+	use, _ := cmd.Flags().GetString("use")
+
+	set, _, _ := m.GetJsonWebKeySet(id)
+	if set == nil {
+		set = new(hydra.JsonWebKeySet)
+	}
+
+	for _, path := range args[1:] {
+		file, err := ioutil.ReadFile(path)
+		pkg.Must(err, "Unable to read file %s", path)
+
+		if key, privateErr := pkg.LoadPrivateKey(file); privateErr != nil {
+			key, publicErr := pkg.LoadPublicKey(file)
+			if publicErr != nil {
+				fmt.Printf("Unable to read key from file %s. Decoding file to private key failed with reason \"%s\" and decoding it to public key failed with reason \"%s\".\n", path, privateErr, publicErr)
+				os.Exit(1)
+			}
+
+			set.Keys = append(set.Keys, toSDKFriendlyJSONWebKey(key, "public:"+uuid.New(), use, true))
+		} else {
+			set.Keys = append(set.Keys, toSDKFriendlyJSONWebKey(key, "private:"+uuid.New(), use, false))
+		}
+
+		fmt.Printf("Successfully loaded key from file %s\n", path)
+	}
+
+	_, response, err := m.UpdateJsonWebKeySet(id, *set)
+	checkResponse(response, err, http.StatusOK)
+
+	fmt.Println("Keys successfully imported!")
 }
 
 func (h *JWKHandler) GetKeys(cmd *cobra.Command, args []string) {
